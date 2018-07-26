@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/devfacet/gocmd"
@@ -24,6 +25,7 @@ type sub struct {
 var subs = []sub{}
 
 var debug = ""
+var dryrun = false
 
 //c.Visit("https://subdivx.com/index.php?buscar=smallville+s01e06&accion=5&masdesc=&subtitulos=1&realiza_b=1")
 func generateURL(args string) string {
@@ -44,13 +46,15 @@ func generateURL(args string) string {
 func main() {
 
 	flags := struct {
-		Help    bool   `short:"h" long:"help" description:"Display usage" global:"true"`
-		Version bool   `short:"v" long:"version" description:"Display version"`
-		Infile  string `short:"i" long:"infile" required:"false" description:"Input video filename for subtitle smart search"`
+		Help    bool   `short:"h" long:"help"                     description:"Display usage" global:"true"`
+		Version bool   `short:"v" long:"version"                  description:"Display version"`
+		DryRun  bool   `short:"d" long:"dryrun"                   description:"Do not make changes to the filesystem"`
+		Infile  string `short:"i" long:"infile"  required:"false" description:"Input video filename for subtitle smart search. Has to be single or double quoted"`
 		Outfile string `short:"o" long:"outfile" required:"false" description:"Output filename for the subtitle"`
-		Lang    string `short:"l" long:"lang" required:"false" description:"Preferred language for download. Also sets the output name`
-		Debug   bool   `long:"b" description:"Enable debugging"`
-		DebugEx bool   `long:"bb" description:"Enable extended debugging"`
+		Lang    string `short:"l" long:"lang"    required:"false" description:"Preferred language for download. Also sets the output name"`
+		Regex   string `short:"r" long:"regex"   required:"false" description:"Regex pattern to apply to the Infile for seaching the subtitle. Must be used between quotes or double quotes"`
+		Debug   bool   `long:"b"                                  description:"Enable debugging"`
+		DebugEx bool   `long:"bb"                                 description:"Enable extended debugging"`
 		Grab    struct {
 			Settings bool `settings:"true" allow-unknown-arg:"true"`
 		} `command:"grab" description:"Grabs a subtitle based on the provided arguments"`
@@ -59,7 +63,7 @@ func main() {
 	cmd, err := gocmd.New(gocmd.Options{
 		Name:        "subgrab",
 		Version:     "0.0.1",
-		Description: "A smart (well, not su much right now) subtitle grabber",
+		Description: "A smart (well, not so much right now) subtitle grabber",
 		Flags:       &flags,
 		AutoHelp:    true,
 		AutoVersion: true,
@@ -78,6 +82,12 @@ func main() {
 		fmt.Println("WARNING: **EXTENDED** DEBUG ENABLED!")
 	}
 
+	// Set Dryrun
+	if flags.DryRun {
+		dryrun = true
+		fmt.Println("RUNNING IN DRYRUN")
+	}
+
 	// Lang parameter
 	lang := flags.Lang
 	if debug == "b" {
@@ -89,24 +99,10 @@ func main() {
 	if debug == "b" {
 		fmt.Println("Infile:", infile)
 	}
-
-	// Outfile parameter
-	outfile := ""
-
-	if infile != "" {
-		filename := infile[0 : len(infile)-len(filepath.Ext(infile))]
-		outfile = filename + ".srt"
-	} else {
-		outfile = flags.Outfile
-	}
-
-	if lang != "" {
-		filename := outfile[0 : len(outfile)-len(filepath.Ext(outfile))]
-		outfile = filename + "." + lang + ".srt"
-	}
-
+	regex := flags.Regex
+	r := regexp.MustCompile(regex)
 	if debug == "b" {
-		fmt.Println("Outfile:", outfile)
+		fmt.Println("Regex:", regex)
 	}
 
 	// Grab command
@@ -119,11 +115,51 @@ func main() {
 			fmt.Println("Args:", args)
 		}
 
-		grabSub(args, outfile)
+		// Get the files to process
+		matches, err := filepath.Glob(infile)
+		if err != nil {
+			fmt.Println(err)
+		}
+		if debug == "b" {
+			fmt.Println("Directory matches:", matches)
+		}
+		for _, file := range matches {
+
+			if debug == "b" {
+				fmt.Println("File:", file)
+			}
+
+			keywords := args + " " + fmt.Sprintf("%v", r.FindString(file))
+			// Outfile parameter
+			outfile := ""
+			filename := ""
+			if file != "" {
+				filename = file[0 : len(file)-len(filepath.Ext(file))]
+			} else {
+				outfile = flags.Outfile
+				filename = outfile[0 : len(outfile)-len(filepath.Ext(outfile))]
+			}
+
+			if lang != "" {
+				outfile = filename + "." + lang + ".srt"
+			} else {
+				outfile = filename + ".srt"
+			}
+
+			if debug == "b" {
+				fmt.Println("Outfile:", outfile)
+			}
+			subs = []sub{}
+			grabSub(keywords, outfile)
+		}
 	}
 }
 
 func grabSub(args string, outfile string) {
+	if debug == "b" {
+		fmt.Println("grabSub.args", args)
+		fmt.Println("grabSub.outfile", outfile)
+	}
 	c := colly.NewCollector(
 		//Allowed domains
 		colly.AllowedDomains("www.subdivx.com", "subdivx.com"),
@@ -148,24 +184,32 @@ func grabSub(args string, outfile string) {
 
 		subs = append(subs, psub)
 	})
-	c.Visit(generateURL(args))
-	c.Wait()
 
-	if debug == "bb" {
-		fmt.Println("Possible subtitles list")
-		fmt.Printf("%# v", pretty.Formatter(subs))
+	url := generateURL(args)
+	if debug == "b" {
+		fmt.Println("URL:", url)
 	}
-	zipFile := "tmp.zip"
-	log.Println("Getting sub for", subs[0].desc)
-	downloadFile(zipFile, subs[0].link)
-	log.Println("Unzipping and deleting file", zipFile)
-	files, err := unzip(zipFile, ".", true)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if outfile != "" {
-		log.Println("Saving to", outfile)
-		os.Rename(files[0], outfile)
+
+	if !dryrun {
+		c.Visit(url)
+		c.Wait()
+
+		if debug == "bb" {
+			fmt.Println("Possible subtitles list")
+			fmt.Printf("%# v", pretty.Formatter(subs))
+		}
+		zipFile := "tmp.zip"
+		log.Println("Getting sub for", subs[0].desc)
+		downloadFile(zipFile, subs[0].link)
+		log.Println("Unzipping and deleting file", zipFile)
+		files, err := unzip(zipFile, ".", true)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if outfile != "" {
+			log.Println("Saving to", outfile)
+			os.Rename(files[0], outfile)
+		}
 	}
 }
 
