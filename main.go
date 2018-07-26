@@ -1,9 +1,14 @@
 package main
 
 import (
+	"archive/zip"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/devfacet/gocmd"
@@ -18,7 +23,7 @@ type sub struct {
 
 var subs = []sub{}
 
-var debug = false
+var debug = ""
 
 //c.Visit("https://subdivx.com/index.php?buscar=smallville+s01e06&accion=5&masdesc=&subtitulos=1&realiza_b=1")
 func generateURL(args string) string {
@@ -39,9 +44,13 @@ func generateURL(args string) string {
 func main() {
 
 	flags := struct {
-		Help    bool `short:"h" long:"help" description:"Display usage" global:"true"`
-		Version bool `short:"v" long:"version" description:"Display version"`
-		Debug   bool `short:"b" long:"debub" description:"Enable debugging"`
+		Help    bool   `short:"h" long:"help" description:"Display usage" global:"true"`
+		Version bool   `short:"v" long:"version" description:"Display version"`
+		Infile  string `short:"i" long:"infile" required:"false" description:"Input video filename for subtitle smart search"`
+		Outfile string `short:"o" long:"outfile" required:"false" description:"Output filename for the subtitle"`
+		Lang    string `short:"l" long:"lang" required:"false" description:"Preferred language for download. Also sets the output name`
+		Debug   bool   `long:"b" description:"Enable debugging"`
+		DebugEx bool   `long:"bb" description:"Enable extended debugging"`
 		Grab    struct {
 			Settings bool `settings:"true" allow-unknown-arg:"true"`
 		} `command:"grab" description:"Grabs a subtitle based on the provided arguments"`
@@ -62,19 +71,59 @@ func main() {
 
 	// Set Debug
 	if cmd.FlagArgs("Debug") != nil {
-		debug = true
+		debug = "b"
 		fmt.Println("WARNING: DEBUG ENABLED!")
+	} else if cmd.FlagArgs("DebugEx") != nil {
+		debug = "bb"
+		fmt.Println("WARNING: **EXTENDED** DEBUG ENABLED!")
+	}
+
+	// Lang parameter
+	lang := flags.Lang
+	if debug == "b" {
+		fmt.Println("Lang:", lang)
+	}
+
+	// Infile parameter
+	infile := flags.Infile
+	if debug == "b" {
+		fmt.Println("Infile:", infile)
+	}
+
+	// Outfile parameter
+	outfile := ""
+
+	if infile != "" {
+		filename := infile[0 : len(infile)-len(filepath.Ext(infile))]
+		outfile = filename + ".srt"
+	} else {
+		outfile = flags.Outfile
+	}
+
+	if lang != "" {
+		filename := outfile[0 : len(outfile)-len(filepath.Ext(outfile))]
+		outfile = filename + "." + lang + ".srt"
+	}
+
+	if debug == "b" {
+		fmt.Println("Outfile:", outfile)
 	}
 
 	// Grab command
 	if cmd.FlagArgs("Grab") != nil {
 		args := strings.Trim(fmt.Sprintf("%s\n", strings.TrimRight(strings.TrimLeft(fmt.Sprintf("%v",
 			cmd.FlagArgs("Grab")[1:]), "["), "]")), "\n")
-		grabSub(args)
+
+		if debug == "b" {
+			fmt.Println("Grab:", cmd.FlagArgs("Grab"))
+			fmt.Println("Args:", args)
+		}
+
+		grabSub(args, outfile)
 	}
 }
 
-func grabSub(args string) {
+func grabSub(args string, outfile string) {
 	c := colly.NewCollector(
 		//Allowed domains
 		colly.AllowedDomains("www.subdivx.com", "subdivx.com"),
@@ -86,7 +135,7 @@ func grabSub(args string) {
 	})
 
 	c.OnResponse(func(r *colly.Response) {
-		if debug {
+		if debug == "bb" {
 			log.Println(string(r.Body))
 		}
 	})
@@ -101,5 +150,106 @@ func grabSub(args string) {
 	})
 	c.Visit(generateURL(args))
 	c.Wait()
-	fmt.Printf("%# v", pretty.Formatter(subs))
+
+	if debug == "bb" {
+		fmt.Println("Possible subtitles list")
+		fmt.Printf("%# v", pretty.Formatter(subs))
+	}
+	zipFile := "tmp.zip"
+	log.Println("Getting sub for", subs[0].desc)
+	downloadFile(zipFile, subs[0].link)
+	log.Println("Unzipping and deleting file", zipFile)
+	files, err := unzip(zipFile, ".", true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if outfile != "" {
+		log.Println("Saving to", outfile)
+		os.Rename(files[0], outfile)
+	}
+}
+
+// downloadFile will download a url to a local file. It's efficient because it will
+// write as it downloads and not load the whole file into memory.
+func downloadFile(filepath string, url string) error {
+
+	// Create the file
+	out, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	// Get the data
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Write the body to file
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// unzip will decompress a zip archive, moving all files and folders
+// within the zip file (parameter 1) to an output directory (parameter 2).
+func unzip(src string, dest string, deleteZipFile bool) ([]string, error) {
+
+	var filenames []string
+
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return filenames, err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+
+		rc, err := f.Open()
+		if err != nil {
+			return filenames, err
+		}
+		defer rc.Close()
+
+		// Store filename/path for returning and using later on
+		fpath := filepath.Join(dest, f.Name)
+		filenames = append(filenames, fpath)
+
+		if f.FileInfo().IsDir() {
+
+			// Make Folder
+			os.MkdirAll(fpath, os.ModePerm)
+
+		} else {
+
+			// Make File
+			if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+				return filenames, err
+			}
+
+			outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+			if err != nil {
+				return filenames, err
+			}
+
+			_, err = io.Copy(outFile, rc)
+
+			// Close the file without defer to close before next iteration of loop
+			outFile.Close()
+
+			if err != nil {
+				return filenames, err
+			}
+
+		}
+	}
+	if deleteZipFile {
+		os.Remove(src)
+	}
+	return filenames, nil
 }
